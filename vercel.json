@@ -1,0 +1,18 @@
+vercel_config = {
+    "version": 2,
+    "builds": [
+        {
+            "src": "api/index.py",
+            "use": "@vercel/python"
+        }
+    ],
+    "routes": [
+        {
+            "src": "/(.*)",
+            "dest": "api/index.py"
+        }
+    ],
+    "env": {
+        "POLYGON_API_KEY": "@polygon_api_key"
+    }
+}
