@@ -8,3 +8,596 @@ scipy==1.11.1
 
 with open('requirements.txt', 'w') as f:
     f.write(requirements)
+
+# Create the API directory structure and move the main script
+import os
+import shutil
+
+# Create api directory
+if not os.path.exists('api'):
+    os.makedirs('api')
+
+# Create the main API file in the correct location
+api_script = '''
+from flask import Flask, request, jsonify
+import pandas as pd
+import numpy as np
+import requests
+import json
+from datetime import datetime, timedelta
+import os
+from scipy.signal import argrelextrema
+import warnings
+warnings.filterwarnings('ignore')
+
+app = Flask(__name__)
+
+# Configuration
+POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', 'your_polygon_api_key_here')
+
+class SupportResistanceAnalyzer:
+    def __init__(self, symbol='SPY', timeframe='hour', multiplier=1, lookback_days=30):
+        self.symbol = symbol
+        self.timeframe = timeframe
+        self.multiplier = multiplier
+        self.lookback_days = lookback_days
+        
+        # Strategy parameters
+        self.pivot_window = 5
+        self.min_touches = 2
+        self.zone_thickness = 0.002
+        self.volume_threshold = 1.5
+        self.gap_threshold = 0.005
+        self.imbalance_ratio = 2.0
+        self.liquidity_window = 10
+        
+        # Weights for zone strength scoring
+        self.touch_weight = 0.4
+        self.volume_weight = 0.3
+        self.time_weight = 0.2
+        self.recent_weight = 0.1
+    
+    def fetch_data(self):
+        """Fetch market data from Polygon API"""
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=self.lookback_days * 2)
+        
+        url = f"https://api.polygon.io/v2/aggs/ticker/{self.symbol}/range/{self.multiplier}/{self.timeframe}/{start_date.strftime('%Y-%m-%d')}/{end_date.strftime('%Y-%m-%d')}"
+        
+        params = {
+            'apikey': POLYGON_API_KEY,
+            'limit': 50000
+        }
+        
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'results' not in data:
+                raise Exception("No data returned from API")
+            
+            # Convert to DataFrame
+            df_data = []
+            for result in data['results']:
+                df_data.append({
+                    'timestamp': pd.to_datetime(result['t'], unit='ms'),
+                    'open': result['o'],
+                    'high': result['h'],
+                    'low': result['l'],
+                    'close': result['c'],
+                    'volume': result['v']
+                })
+            
+            df = pd.DataFrame(df_data)
+            df.set_index('timestamp', inplace=True)
+            df = df.sort_index()
+            
+            # Add technical indicators
+            df['hl2'] = (df['high'] + df['low']) / 2
+            df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
+            df['volume_sma'] = df['volume'].rolling(window=20).mean()
+            
+            return df
+            
+        except Exception as e:
+            raise Exception(f"Error fetching data: {str(e)}")
+    
+    def identify_pivot_points(self, df):
+        """Identify pivot highs and lows"""
+        # Find local maxima (resistance levels)
+        highs = argrelextrema(df['high'].values, np.greater, order=self.pivot_window)[0]
+        # Find local minima (support levels)
+        lows = argrelextrema(df['low'].values, np.less, order=self.pivot_window)[0]
+        
+        pivot_highs = []
+        pivot_lows = []
+        
+        for idx in highs:
+            if idx < len(df):
+                pivot_highs.append({
+                    'timestamp': df.index[idx].isoformat(),
+                    'price': float(df.iloc[idx]['high']),
+                    'type': 'resistance',
+                    'volume': float(df.iloc[idx]['volume'])
+                })
+        
+        for idx in lows:
+            if idx < len(df):
+                pivot_lows.append({
+                    'timestamp': df.index[idx].isoformat(),
+                    'price': float(df.iloc[idx]['low']),
+                    'type': 'support',
+                    'volume': float(df.iloc[idx]['volume'])
+                })
+        
+        return pivot_highs, pivot_lows
+    
+    def cluster_levels(self, levels):
+        """Cluster nearby levels into zones"""
+        if not levels:
+            return []
+        
+        sorted_levels = sorted(levels, key=lambda x: x['price'])
+        clusters = []
+        current_cluster = [sorted_levels[0]]
+        
+        for level in sorted_levels[1:]:
+            cluster_center = np.mean([l['price'] for l in current_cluster])
+            if abs(level['price'] - cluster_center) / cluster_center <= self.zone_thickness:
+                current_cluster.append(level)
+            else:
+                clusters.append(current_cluster)
+                current_cluster = [level]
+        
+        clusters.append(current_cluster)
+        return clusters
+    
+    def calculate_zone_strength(self, cluster, df):
+        """Calculate zone strength score"""
+        prices = [level['price'] for level in cluster]
+        volumes = [level['volume'] for level in cluster]
+        timestamps = [pd.to_datetime(level['timestamp']) for level in cluster]
+        
+        zone_center = np.mean(prices)
+        zone_top = max(prices)
+        zone_bottom = min(prices)
+        total_volume = sum(volumes)
+        touch_count = len(cluster)
+        
+        # Time-based metrics
+        latest_touch = max(timestamps)
+        earliest_touch = min(timestamps)
+        time_span = (latest_touch - earliest_touch).total_seconds() / 3600
+        
+        # Recent activity
+        recent_threshold = df.index[-1] - timedelta(hours=len(df) * 0.2)
+        recent_touches = sum(1 for ts in timestamps if ts >= recent_threshold)
+        
+        # Calculate strength score
+        touch_score = min(touch_count * 20, 60)
+        volume_score = min(total_volume / df['volume'].mean() * 10, 25)
+        time_score = min(time_span / 24 * 10, 10)
+        recent_score = recent_touches * 5
+        
+        strength = (
+            touch_score * self.touch_weight +
+            volume_score * self.volume_weight +
+            time_score * self.time_weight +
+            recent_score * self.recent_weight
+        )
+        
+        return {
+            'center': float(zone_center),
+            'top': float(zone_top),
+            'bottom': float(zone_bottom),
+            'strength': float(min(strength, 100)),
+            'touches': int(touch_count),
+            'total_volume': float(total_volume),
+            'time_span_hours': float(time_span),
+            'recent_touches': int(recent_touches),
+            'type': cluster[0]['type']
+        }
+    
+    def identify_liquidity_zones(self, df):
+        """Identify various types of liquidity zones"""
+        liquidity_zones = []
+        
+        # Fair Value Gaps
+        for i in range(1, len(df)):
+            prev_candle = df.iloc[i-1]
+            curr_candle = df.iloc[i]
+            
+            # Bullish gap
+            if curr_candle['low'] > prev_candle['high']:
+                gap_size = (curr_candle['low'] - prev_candle['high']) / prev_candle['high']
+                if gap_size >= self.gap_threshold:
+                    # Check if gap is still unfilled
+                    filled = False
+                    for j in range(i+1, min(i+20, len(df))):
+                        if df.iloc[j]['low'] <= prev_candle['high']:
+                            filled = True
+                            break
+                    
+                    if not filled:
+                        liquidity_zones.append({
+                            'top': float(curr_candle['low']),
+                            'bottom': float(prev_candle['high']),
+                            'center': float((curr_candle['low'] + prev_candle['high']) / 2),
+                            'timestamp': df.index[i].isoformat(),
+                            'type': 'bullish_fvg',
+                            'strength': float(min(gap_size * 1000, 100)),
+                            'volume': float(curr_candle['volume'])
+                        })
+            
+            # Bearish gap
+            elif curr_candle['high'] < prev_candle['low']:
+                gap_size = (prev_candle['low'] - curr_candle['high']) / curr_candle['high']
+                if gap_size >= self.gap_threshold:
+                    filled = False
+                    for j in range(i+1, min(i+20, len(df))):
+                        if df.iloc[j]['high'] >= prev_candle['low']:
+                            filled = True
+                            break
+                    
+                    if not filled:
+                        liquidity_zones.append({
+                            'top': float(prev_candle['low']),
+                            'bottom': float(curr_candle['high']),
+                            'center': float((prev_candle['low'] + curr_candle['high']) / 2),
+                            'timestamp': df.index[i].isoformat(),
+                            'type': 'bearish_fvg',
+                            'strength': float(min(gap_size * 1000, 100)),
+                            'volume': float(curr_candle['volume'])
+                        })
+        
+        # High Volume Areas
+        volume_threshold = df['volume'].mean() * self.volume_threshold
+        for i in range(self.liquidity_window, len(df) - self.liquidity_window):
+            window_data = df.iloc[i-self.liquidity_window:i+self.liquidity_window+1]
+            
+            if window_data['volume'].mean() > volume_threshold:
+                liquidity_zones.append({
+                    'top': float(window_data['high'].max()),
+                    'bottom': float(window_data['low'].min()),
+                    'center': float(window_data['hlc3'].mean()),
+                    'volume': float(window_data['volume'].sum()),
+                    'timestamp': df.index[i].isoformat(),
+                    'type': 'high_volume',
+                    'strength': float(min(window_data['volume'].mean() / df['volume'].mean() * 20, 100))
+                })
+        
+        # Order Flow Imbalances
+        for i in range(2, len(df) - 1):
+            candle1 = df.iloc[i-2]
+            candle2 = df.iloc[i-1]
+            candle3 = df.iloc[i]
+            
+            # Bullish imbalance
+            if (candle2['low'] > candle1['low'] and 
+                candle3['low'] > candle2['low'] and
+                candle3['volume'] > candle2['volume'] * self.imbalance_ratio):
+                
+                liquidity_zones.append({
+                    'top': float(max(candle1['high'], candle2['high'], candle3['high'])),
+                    'bottom': float(min(candle1['low'], candle2['low'], candle3['low'])),
+                    'center': float((candle1['hlc3'] + candle2['hlc3'] + candle3['hlc3']) / 3),
+                    'timestamp': df.index[i].isoformat(),
+                    'type': 'bullish_imbalance',
+                    'strength': float(min(candle3['volume'] / df['volume'].mean() * 25, 100)),
+                    'volume': float(candle3['volume'])
+                })
+            
+            # Bearish imbalance
+            elif (candle2['high'] < candle1['high'] and 
+                  candle3['high'] < candle2['high'] and
+                  candle3['volume'] > candle2['volume'] * self.imbalance_ratio):
+                
+                liquidity_zones.append({
+                    'top': float(max(candle1['high'], candle2['high'], candle3['high'])),
+                    'bottom': float(min(candle1['low'], candle2['low'], candle3['low'])),
+                    'center': float((candle1['hlc3'] + candle2['hlc3'] + candle3['hlc3']) / 3),
+                    'timestamp': df.index[i].isoformat(),
+                    'type': 'bearish_imbalance',
+                    'strength': float(min(candle3['volume'] / df['volume'].mean() * 25, 100)),
+                    'volume': float(candle3['volume'])
+                })
+        
+        return liquidity_zones
+    
+    def generate_trading_signals(self, df, resistance_zones, support_zones, liquidity_zones):
+        """Generate trading signals based on current price and zones"""
+        signals = []
+        current_price = float(df['close'].iloc[-1])
+        
+        # Check resistance zones
+        for zone in resistance_zones[:3]:
+            distance = abs(zone['center'] - current_price) / current_price
+            if distance <= 0.005:  # Within 0.5%
+                volume_factor = min(df['volume'].iloc[-1] / df['volume'].mean() * 25, 50)
+                signal_strength = min((zone['strength'] * 0.5) + ((1-distance)*50 * 0.3) + (volume_factor * 0.2), 100)
+                
+                signals.append({
+                    'type': 'SELL',
+                    'reason': 'Near Resistance Zone',
+                    'zone_price': zone['center'],
+                    'current_price': current_price,
+                    'distance_pct': float(distance * 100),
+                    'zone_strength': zone['strength'],
+                    'signal_strength': float(signal_strength),
+                    'stop_loss': float(zone['top'] + (zone['top'] - zone['bottom']) * 0.5),
+                    'take_profit': float(current_price - (zone['center'] - current_price) * 2)
+                })
+        
+        # Check support zones
+        for zone in support_zones[:3]:
+            distance = abs(zone['center'] - current_price) / current_price
+            if distance <= 0.005:  # Within 0.5%
+                volume_factor = min(df['volume'].iloc[-1] / df['volume'].mean() * 25, 50)
+                signal_strength = min((zone['strength'] * 0.5) + ((1-distance)*50 * 0.3) + (volume_factor * 0.2), 100)
+                
+                signals.append({
+                    'type': 'BUY',
+                    'reason': 'Near Support Zone',
+                    'zone_price': zone['center'],
+                    'current_price': current_price,
+                    'distance_pct': float(distance * 100),
+                    'zone_strength': zone['strength'],
+                    'signal_strength': float(signal_strength),
+                    'stop_loss': float(zone['bottom'] - (zone['top'] - zone['bottom']) * 0.5),
+                    'take_profit': float(current_price + (current_price - zone['center']) * 2)
+                })
+        
+        # Check high-strength liquidity zones
+        high_strength_liquidity = [z for z in liquidity_zones if z['strength'] > 75]
+        for zone in high_strength_liquidity:
+            distance = abs(zone['center'] - current_price) / current_price
+            if distance <= 0.003:  # Within 0.3%
+                
+                if zone['type'] in ['bullish_fvg', 'bullish_imbalance']:
+                    signals.append({
+                        'type': 'BUY',
+                        'reason': f'Bullish Liquidity Zone ({zone["type"]})',
+                        'zone_price': zone['center'],
+                        'current_price': current_price,
+                        'distance_pct': float(distance * 100),
+                        'zone_strength': zone['strength'],
+                        'signal_strength': float(min(zone['strength'] * 0.8, 100)),
+                        'stop_loss': float(zone['bottom'] * 0.995),
+                        'take_profit': float(current_price + (zone['top'] - zone['bottom']) * 1.5)
+                    })
+                
+                elif zone['type'] in ['bearish_fvg', 'bearish_imbalance']:
+                    signals.append({
+                        'type': 'SELL',
+                        'reason': f'Bearish Liquidity Zone ({zone["type"]})',
+                        'zone_price': zone['center'],
+                        'current_price': current_price,
+                        'distance_pct': float(distance * 100),
+                        'zone_strength': zone['strength'],
+                        'signal_strength': float(min(zone['strength'] * 0.8, 100)),
+                        'stop_loss': float(zone['top'] * 1.005),
+                        'take_profit': float(current_price - (zone['top'] - zone['bottom']) * 1.5)
+                    })
+        
+        # Sort by strength
+        signals.sort(key=lambda x: x['signal_strength'], reverse=True)
+        return signals
+    
+    def analyze(self):
+        """Main analysis function"""
+        try:
+            # Fetch data
+            df = self.fetch_data()
+            
+            # Identify pivot points
+            pivot_highs, pivot_lows = self.identify_pivot_points(df)
+            
+            # Cluster levels into zones
+            resistance_clusters = self.cluster_levels(pivot_highs)
+            support_clusters = self.cluster_levels(pivot_lows)
+            
+            # Calculate zone strengths
+            resistance_zones = []
+            for cluster in resistance_clusters:
+                if len(cluster) >= self.min_touches:
+                    zone = self.calculate_zone_strength(cluster, df)
+                    resistance_zones.append(zone)
+            
+            support_zones = []
+            for cluster in support_clusters:
+                if len(cluster) >= self.min_touches:
+                    zone = self.calculate_zone_strength(cluster, df)
+                    support_zones.append(zone)
+            
+            # Sort zones by strength
+            resistance_zones.sort(key=lambda x: x['strength'], reverse=True)
+            support_zones.sort(key=lambda x: x['strength'], reverse=True)
+            
+            # Identify liquidity zones
+            liquidity_zones = self.identify_liquidity_zones(df)
+            liquidity_zones.sort(key=lambda x: x['strength'], reverse=True)
+            
+            # Generate trading signals
+            signals = self.generate_trading_signals(df, resistance_zones, support_zones, liquidity_zones)
+            
+            # Current market analysis
+            current_price = float(df['close'].iloc[-1])
+            
+            # Find nearest zones
+            nearest_resistance = None
+            nearest_support = None
+            
+            for zone in resistance_zones:
+                if zone['center'] > current_price:
+                    if nearest_resistance is None or zone['center'] < nearest_resistance['center']:
+                        nearest_resistance = zone
+            
+            for zone in support_zones:
+                if zone['center'] < current_price:
+                    if nearest_support is None or zone['center'] > nearest_support['center']:
+                        nearest_support = zone
+            
+            return {
+                'symbol': self.symbol,
+                'current_price': current_price,
+                'last_updated': datetime.now().isoformat(),
+                'data_periods': len(df),
+                'date_range': {
+                    'start': df.index[0].isoformat(),
+                    'end': df.index[-1].isoformat()
+                },
+                'resistance_zones': resistance_zones[:10],  # Top 10
+                'support_zones': support_zones[:10],  # Top 10
+                'liquidity_zones': liquidity_zones[:20],  # Top 20
+                'trading_signals': signals[:5],  # Top 5
+                'market_analysis': {
+                    'nearest_resistance': nearest_resistance,
+                    'nearest_support': nearest_support,
+                    'active_liquidity_zones': len([z for z in liquidity_zones if z['strength'] > 50])
+                },
+                'zone_summary': {
+                    'total_resistance_zones': len(resistance_zones),
+                    'total_support_zones': len(support_zones),
+                    'total_liquidity_zones': len(liquidity_zones),
+                    'liquidity_by_type': {
+                        'bullish_fvg': len([z for z in liquidity_zones if z['type'] == 'bullish_fvg']),
+                        'bearish_fvg': len([z for z in liquidity_zones if z['type'] == 'bearish_fvg']),
+                        'bullish_imbalance': len([z for z in liquidity_zones if z['type'] == 'bullish_imbalance']),
+                        'bearish_imbalance': len([z for z in liquidity_zones if z['type'] == 'bearish_imbalance']),
+                        'high_volume': len([z for z in liquidity_zones if z['type'] == 'high_volume'])
+                    }
+                }
+            }
+            
+        except Exception as e:
+            return {'error': str(e)}
+
+# API Routes
+@app.route('/')
+def home():
+    return jsonify({
+        'message': 'Support/Resistance & Liquidity Zones API',
+        'version': '1.0.0',
+        'endpoints': {
+            '/analyze': 'GET - Analyze support/resistance and liquidity zones',
+            '/analyze/<symbol>': 'GET - Analyze specific symbol',
+            '/health': 'GET - Health check'
+        },
+        'parameters': {
+            'symbol': 'Stock symbol (default: SPY)',
+            'timeframe': 'minute, hour, day (default: hour)',
+            'multiplier': 'Multiplier for timeframe (default: 1)',
+            'lookback_days': 'Days of data to analyze (default: 30)'
+        }
+    })
+
+@app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+
+@app.route('/analyze')
+@app.route('/analyze/<symbol>')
+def analyze(symbol='SPY'):
+    try:
+        # Get query parameters
+        timeframe = request.args.get('timeframe', 'hour')
+        multiplier = int(request.args.get('multiplier', 1))
+        lookback_days = int(request.args.get('lookback_days', 30))
+        
+        # Validate parameters
+        if timeframe not in ['minute', 'hour', 'day']:
+            return jsonify({'error': 'Invalid timeframe. Use: minute, hour, day'}), 400
+        
+        if multiplier < 1 or multiplier > 1000:
+            return jsonify({'error': 'Invalid multiplier. Range: 1-1000'}), 400
+        
+        if lookback_days < 1 or lookback_days > 365:
+            return jsonify({'error': 'Invalid lookback_days. Range: 1-365'}), 400
+        
+        # Create analyzer and run analysis
+        analyzer = SupportResistanceAnalyzer(
+            symbol=symbol.upper(),
+            timeframe=timeframe,
+            multiplier=multiplier,
+            lookback_days=lookback_days
+        )
+        
+        result = analyzer.analyze()
+        
+        if 'error' in result:
+            return jsonify(result), 500
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
+
+# For Vercel deployment
+def handler(request):
+    return app(request.environ, lambda *args: None)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+'''
+
+# Save the API script to the correct location
+with open('api/index.py', 'w') as f:
+    f.write(api_script)
+
+# Create README with deployment instructions
+readme_content = """# Support/Resistance & Liquidity Zones API
+
+A sophisticated Python API for analyzing support/resistance levels and liquidity zones in financial markets.
+
+## Features
+
+- **Support & Resistance Detection**: Pivot-based identification with zone clustering
+- **Liquidity Zone Analysis**: Fair Value Gaps, Order Flow Imbalances, High Volume areas
+- **Zone Strength Scoring**: Multi-factor strength assessment
+- **Trading Signals**: Real-time signal generation based on price proximity to zones
+- **RESTful API**: Easy integration with any application
+
+## API Endpoints
+
+### GET `/`
+Returns API information and available endpoints.
+
+### GET `/health`
+Health check endpoint.
+
+### GET `/analyze`
+Analyze SPY with default parameters.
+
+### GET `/analyze/<symbol>`
+Analyze specific symbol (e.g., `/analyze/AAPL`).
+
+#### Query Parameters:
+- `timeframe`: minute, hour, day (default: hour)
+- `multiplier`: 1-1000 (default: 1)
+- `lookback_days`: 1-365 (default: 30)
+
+## Example Usage
+
+```bash
+# Basic analysis
+curl https://your-api-url.vercel.app/analyze/AAPL
+
+# Custom parameters
+curl "https://your-api-url.vercel.app/analyze/TSLA?timeframe=day&lookback_days=60"
+```
+
+## Response Format
+
+```json
+{
+  "symbol": "AAPL",
+  "current_price": 150.25,
+  "last_updated": "2023-12-01T10:30:00",
+  "resistance_zones": [...],
+  "support_zones": [...],
+  "liquidity_zones": [...],
+  "trading_signals": [...],
+  "market_analysis": {...},
+  "zone_summary": {...}
+}
